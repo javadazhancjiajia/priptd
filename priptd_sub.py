@@ -1,5 +1,7 @@
 import math
 import os
+from datetime import datetime
+
 from phe import paillier
 
 import numpy as np
@@ -71,7 +73,7 @@ class Server:
                 truth_set.append(sum_truth / sum_weight)
             return truth_set
         else:
-            print("error flag value")
+            print("errors flag value")
 
 
 class FogNode:
@@ -99,11 +101,10 @@ class FogNode:
 
 
 class Worker:
-    def __init__(self, epsilon, omega, alpha1, w, raw_data):
+    def __init__(self, epsilon, omega, alpha1, raw_data):
         self.epsilon = epsilon
         self.alpha1 = alpha1
         self.omega = omega
-        self.w = w
         self.raw_data = raw_data
 
         self.info = {
@@ -111,7 +112,8 @@ class Worker:
             "cost_budgets": [],
             "crh_weights": [],
             "avg": 0,
-            "variant": 0,
+            "var": 0,
+            "var_changes": [],
             "weight_error": [],
             "imp": 0.0,
             "credibility_weight": 0
@@ -119,18 +121,22 @@ class Worker:
 
     # outlier-aware weight estimation mechanism
     def outlier_aware(self):
-        last_variant = self.info["variant"]
+        last_var = self.info["var"]
         last_weight = self.info["crh_weights"][-1]
+        back_len = min(self.info["crh_weights"].__len__(), max(10, self.omega), 15)
+        beta1 = sum(self.info["var_changes"][back_len:]) / back_len
+
         # update attenuation variant
         self.info["avg"] = self.alpha1 * last_weight + (1 - self.alpha1) * self.info["avg"]
-        self.info["variant"] = self.alpha1 * (self.info["avg"] - last_weight) ** 2 + (1 - self.alpha1) * self.info["variant"]
-        d = self.info["variant"] - last_variant
-        if d > self.info["beta1"]:
-            window = min(self.info["crh_weights"].__len__(), self.w)
+        self.info["var"] = self.alpha1 * (self.info["avg"] - last_weight) ** 2 + (1 - self.alpha1) * self.info["var"]
+        self.info["var_changes"].append(math.fabs(self.info["avg"] - last_var))
+
+        d = math.fabs(self.info["var"] - last_var)
+        if d > beta1:
             credibility_weight = 0
-            for i in range(2, window):
+            for i in range(2, back_len + 1):
                 # ARMA
-                xi = (self.alpha1 * (1 - self.alpha1) ** (i-1))
+                xi = (self.alpha1 * (1 - self.alpha1) ** (i - 1))
                 credibility_weight += xi * (self.info["crh_weights"][-i] + self.info["weight_error"][-i])
             credibility_weight += self.alpha1 * last_weight / 2
             self.info["credibility_weight"] = credibility_weight
@@ -140,10 +146,10 @@ class Worker:
 
     # weight-aware budget allocation mechanism
     def weight_aware(self):
-        window = min(self.omega, self.info["crh_weights"].__len__())
+        window = min(self.info["crh_weights"].__len__(), self.omega)
 
         # remaining budget
-        if self.info["cost_budgets"].__len__() > self.omega:
+        if self.info["cost_budgets"].__len__() >= self.omega:
             self.info["left_budget"] += self.info["cost_budgets"][-self.omega]
 
         # compute importance
@@ -165,29 +171,44 @@ class Worker:
                 p = 0.8
             else:
                 p = min(0.8, 1 - 1 / (math.e ** x))
+        p = max(0.2, p)
         budget = self.info["left_budget"] * p
         self.info["cost_budgets"].append(budget)
         self.info["left_budget"] -= budget
         self.info["imp"] = mu
         return budget
 
-    def first_upload_answers(self):
-        self.info["cost_budgets"].append(0)
-        return self.raw_data[0]
+    def first_round(self):
+        budget = self.epsilon / self.omega
+        self.info["cost_budgets"].append(budget)
+        self.info["left_budget"] -= budget
 
-    def before_k_rounds(self, t):
-        self.info["avg"] = self.alpha1 * self.info["crh_weights"][-1] + (1 - self.alpha1) * self.info["avg"]
-        self.info["variant"] = self.alpha1 * (self.info["avg"] - self.info["crh_weights"][-1]) ** 2 + (1 - self.alpha1) * self.info["variant"]
-        self.info["credibility_weight"] = self.info["crh_weights"][-1]
-        self.info["cost_budgets"].append(0)
-        if t == 10:
-            window = min(self.omega, self.info["crh_weights"].__len__())
+        cur_data = self.raw_data[0]
+        perturbed_data = []
+        for d in cur_data:
+            noise = math.fabs(np.random.laplace(0, 1 / budget))
+            perturbed_data.append(d + noise)
+
+        return perturbed_data
+
+    def first_omega_rounds(self, t):
+        if self.info["cost_budgets"].__len__() >= self.omega:
+            self.info["left_budget"] += self.info["cost_budgets"][-self.omega]
+
+        cur_avg = self.alpha1 * self.info["crh_weights"][-1] + (1 - self.alpha1) * self.info["avg"]
+        cur_var = self.alpha1 * (self.info["avg"] - self.info["crh_weights"][-1]) ** 2 + (1 - self.alpha1) * self.info[
+            "var"]
+        if t > 1:
+            self.info["var_changes"].append(math.fabs(self.info["avg"] - cur_avg))
+            window = min(self.info["crh_weights"].__len__(), self.omega)
             self.info["imp"] = self.info["crh_weights"][-1] / sum(self.info["crh_weights"][-window:])
-        return self.raw_data[t], self.info["credibility_weight"]
+        self.info["avg"] = cur_avg
+        self.info["var"] = cur_var
+        self.info["credibility_weight"] = self.info["crh_weights"][-1]
 
-    def after_k_rounds(self, t):
-        self.outlier_aware()
-        budget = self.weight_aware()
+        budget = self.epsilon / self.omega
+        self.info["cost_budgets"].append(budget)
+        self.info["left_budget"] -= budget
 
         cur_data = self.raw_data[t]
         perturbed_data = []
@@ -202,17 +223,49 @@ class Worker:
         for adj_val in adj_array:
             total_temp = 0
             for i in range(cur_data.__len__()):
-                total_temp += math.fabs((self.info["credibility_weight"] + adj_val) * perturbed_data[i] - self.info["credibility_weight"] * cur_data[i])
+                total_temp += math.fabs(
+                    (self.info["credibility_weight"] + adj_val) * perturbed_data[i] - self.info["credibility_weight"] *
+                    cur_data[i])
+            if total_temp < min_temp:
+                candidate = adj_val
+                min_temp = total_temp
+
+        return perturbed_data, self.info["credibility_weight"], candidate
+
+    def after_omega_rounds(self, t):
+        self.outlier_aware()
+        budget = self.weight_aware()
+        # budget = self.epsilon / self.omega
+
+        cur_data = self.raw_data[t]
+        perturbed_data = []
+        adj_array = []
+        for d in cur_data:
+            noise = math.fabs(np.random.laplace(0, 1 / budget))
+            perturbed_data.append(d + noise)
+            adj_array.append(-self.info["credibility_weight"] * noise / (d + noise))
+
+        min_temp = 100000
+        candidate = 0
+        for adj_val in adj_array:
+            total_temp = 0
+            for i in range(cur_data.__len__()):
+                total_temp += math.fabs(
+                    (self.info["credibility_weight"] + adj_val) * perturbed_data[i] - self.info["credibility_weight"] *
+                    cur_data[i])
             if total_temp < min_temp:
                 candidate = adj_val
                 min_temp = total_temp
         return perturbed_data, self.info["credibility_weight"], candidate
 
-    def update_weight(self, t, weight):
-        self.info["weight_error"].append(weight - self.info["credibility_weight"])
-        if t == 10:
-            self.info["beta1"] = sum(self.info["weight_error"]) / (self.info["weight_error"].__len__() - 1)
+    def upload_data(self, t):
+        if t < self.omega:
+            return self.first_omega_rounds(t)
+        else:
+            return self.after_omega_rounds(t)
 
+    def update_weight(self, t, weight):
+        self.info["weight_error"].append(math.fabs(weight - self.info["credibility_weight"]))
         self.info["crh_weights"].append(weight)
 
     def get_data(self, t):
@@ -294,27 +347,16 @@ def weight_estimation2(pk, node: FogNode, data: list, truths: list):
     return weights
 
 
-def start(test_type):
-    dataset_name = "weather"
-
-    log_prefix = f".log/{dataset_name}"
-    base_dataset = ".dataset/" + dataset_name
-
-    if dataset_name == "lab":
+def start(omega, epsilon, test_db_name):
+    if test_db_name == "lab":
         alpha_1 = 0.4
-    elif dataset_name == "weather":
+    elif test_db_name == "weather":
         alpha_1 = 0.2
     else:
         print("unknown dataset")
         return
 
-    epsilon = 1
-    omega = 10
-    beta_2 = 0.01
-
-    w = 0
-    while alpha_1 * ((1 - alpha_1) ** w) >= beta_2:
-        w += 1
+    dataset = ".dataset/" + test_db_name
 
     # Authority Center
     ac = Center()
@@ -326,60 +368,57 @@ def start(test_type):
     # Fog Node
     node = FogNode(server)
 
-    for r in range(100):
-        worker_list = []
-        for file_name in os.listdir(base_dataset):
-            with open(f"{base_dataset}/{file_name}") as f:
-                temp_list = []
-                for line in f:
-                    if base_dataset.endswith("lab"):
-                        ele = line.strip().split(";")[1:]
-                    else:
-                        ele = line.strip().split(";")
-                    answers = [math.fabs(float(x)) for x in ele]
-                    temp_list.append(answers)
-            worker_list.append(Worker(epsilon, omega, alpha_1, w, temp_list))
+    log_prefix = f".log/{test_db_name}"
+    if not os.path.exists(log_prefix):
+        os.makedirs(log_prefix)
 
-        t = worker_list[0].raw_data.__len__()
+    now = datetime.now()
+    formatted_datetime = now.strftime('%Y%m%d%H%M%S')
+    log_file = open(f"{log_prefix}/{formatted_datetime}.txt", "w")
 
-        log_file = open(f"{log_prefix}/{test_type}/1/{r}.txt", "w")
-        for i in range(t):
-            if i == 0:
-                up_data = []
-                for worker in worker_list:
-                    up_data.append(worker.first_upload_answers())
-                discovered_truths = node.upload_sensory_data(1, up_data)
-            elif i <= 10:
-                up_data = []
-                up_weight = []
-                for worker in worker_list:
-                    data, weight = worker.before_k_rounds(i)
-                    up_data.append(data)
-                    up_weight.append(weight)
-                discovered_truths = node.upload_sensory_data(2, up_data, up_weight)
-            else:
-                up_data = []
-                up_weight = []
-                up_adj = []
-                for worker in worker_list:
-                    data, weight, adj = worker.after_k_rounds(i)
-                    up_data.append(data)
-                    up_weight.append(weight)
-                    up_adj.append(adj)
-                discovered_truths = node.upload_sensory_data(3, up_data, up_weight, up_adj)
+    worker_list = []
+    for file_name in os.listdir(dataset):
+        with open(f"{dataset}/{file_name}") as f:
+            temp_list = []
+            for line in f:
+                if dataset.endswith("lab"):
+                    ele = line.strip().split(";")[1:]
+                else:
+                    ele = line.strip().split(";")
+                answers = [math.fabs(float(x)) for x in ele]
+                temp_list.append(answers)
+        worker_list.append(Worker(epsilon, omega, alpha_1, temp_list))
 
-            log_file.write(discovered_truths.__str__() + "\n")
+    t = worker_list[0].raw_data.__len__()
 
-            raw_data = []
+    for i in range(t):
+        if i == 0:
+            up_data = []
             for worker in worker_list:
-                raw_data.append(worker.get_data(i))
+                up_data.append(worker.first_round())
+            discovered_truths = node.upload_sensory_data(1, up_data)
+        else:
+            up_data = []
+            up_weight = []
+            up_adj = []
+            for worker in worker_list:
+                data, weight, adj = worker.upload_data(i)
+                up_data.append(data)
+                up_weight.append(weight)
+                up_adj.append(adj)
+            discovered_truths = node.upload_sensory_data(3, up_data, up_weight, up_adj)
+        log_file.write(discovered_truths.__str__() + "\n")
 
-            # weights = weight_estimation2(pk, node, raw_data, discovered_truths)
-            weights = weight_estimation(raw_data, discovered_truths)
-            for j in range(weights.__len__()):
-                worker_list[j].update_weight(i, weights[j])
-        log_file.close()
+        raw_data = []
+        for worker in worker_list:
+            raw_data.append(worker.get_data(i))
+
+        # weights = weight_estimation2(pk, node, raw_data, discovered_truths)
+        weights = weight_estimation(raw_data, discovered_truths)
+        for j in range(weights.__len__()):
+            worker_list[j].update_weight(i, weights[j])
+    log_file.close()
 
 
 if __name__ == '__main__':
-    start("epsilon")
+    start(10, 1, "weather")
